@@ -12,6 +12,7 @@
 - CQRS, Commands, Queries, MediatR, mediator pattern
 - Entity Framework, EF Core, ORM, migrations, idempotent
 - SQL optimization, indexes, query performance, execution plan, table scan
+- Deadlocks, circular wait, lock resources, transaction order, retry logic
 - SignalR, real-time, WebSockets, hubs, backplane, scaling
 
 ---
@@ -104,6 +105,19 @@
 **A:** Benefits: faster reads, faster joins. Costs: slower writes, storage space, maintenance. Create on frequently queried columns, foreign keys.
 
 **Keywords:** Index, trade-offs, faster reads, slower writes
+
+---
+
+### Deadlocks
+**Q: What are deadlocks?**  
+**A:** Deadlocks occur when transactions wait for each other in a circle - Transaction A waits for B, B waits for A. Database kills one to break it. Happen when transactions access resources in different orders or hold locks too long.
+
+**Keywords:** Deadlock, circular wait, lock resources, transaction order
+
+**Q: How to prevent deadlocks?**  
+**A:** Always access resources in same order. Keep transactions short. Use appropriate isolation levels. Add indexes. Implement retry logic to catch deadlock errors and retry.
+
+**Keywords:** Deadlock prevention, retry logic, transaction order, isolation levels
 
 ---
 
@@ -1539,6 +1553,216 @@ SET STATISTICS TIME ON;
 
 ---
 
+#### Q: What are database deadlocks and when do they happen?
+**SPEAKABLE ANSWER:**  
+"A deadlock occurs when two or more transactions are waiting for each other to release locks, creating a circular dependency. Neither transaction can proceed, so the database automatically kills one transaction to break the deadlock. Deadlocks typically happen when transactions access resources in different orders, or when long-running transactions hold locks for too long."
+
+**What is a deadlock:**
+- **Circular wait** - Transaction A waits for Transaction B, Transaction B waits for Transaction A
+- **Both blocked** - Neither can proceed
+- **Database resolves** - SQL Server automatically kills one transaction (deadlock victim)
+- **Error 1205** - "Transaction was deadlocked on lock resources"
+
+**Example scenario:**
+```
+Transaction 1:
+1. Locks Row A
+2. Tries to lock Row B (waits because Transaction 2 has it)
+
+Transaction 2:
+1. Locks Row B
+2. Tries to lock Row A (waits because Transaction 1 has it)
+
+Result: DEADLOCK - Both waiting for each other
+```
+
+**When deadlocks typically happen:**
+
+**1. Different access order:**
+```sql
+-- Transaction 1
+BEGIN TRANSACTION;
+UPDATE Entities SET Name = 'A' WHERE Id = 1; -- Locks Row 1
+UPDATE Entities SET Name = 'B' WHERE Id = 2; -- Waits for Row 2
+COMMIT;
+
+-- Transaction 2 (different order!)
+BEGIN TRANSACTION;
+UPDATE Entities SET Name = 'B' WHERE Id = 2; -- Locks Row 2
+UPDATE Entities SET Name = 'A' WHERE Id = 1; -- Waits for Row 1
+COMMIT;
+-- DEADLOCK! Different order causes circular wait
+```
+
+**2. Long-running transactions:**
+- Transaction holds locks for extended time
+- Other transactions wait, increasing deadlock risk
+- Common with complex business logic in transactions
+
+**3. Missing indexes:**
+- Queries scan entire tables (table locks)
+- Multiple transactions scanning same table = deadlock risk
+
+**4. Concurrent updates to same rows:**
+- Multiple transactions updating same data simultaneously
+- Especially with foreign key relationships
+
+**5. Nested transactions:**
+- Complex transaction nesting
+- Multiple savepoints increase lock complexity
+
+**Keywords:** Deadlock, circular wait, lock resources, transaction, Error 1205
+
+---
+
+#### Q: How do you prevent and fix deadlocks?
+**SPEAKABLE ANSWER:**  
+"To prevent deadlocks, always access resources in the same order across all transactions. Keep transactions short - do business logic outside transactions, only use transactions for database operations. Use appropriate isolation levels - avoid unnecessary locking. Add indexes to prevent table scans. To fix deadlocks, implement retry logic in your application - catch deadlock errors and retry the transaction."
+
+**Prevention strategies:**
+
+**1. Access resources in consistent order:**
+```sql
+-- ✅ GOOD: Always access in same order (Id ascending)
+UPDATE Entities SET Name = 'A' WHERE Id = 1;
+UPDATE Entities SET Name = 'B' WHERE Id = 2;
+
+-- ✅ GOOD: Same order in all transactions
+UPDATE Entities SET Name = 'B' WHERE Id = 2;
+UPDATE Entities SET Name = 'A' WHERE Id = 1; -- Still safe if same order
+
+-- ❌ BAD: Different orders cause deadlocks
+-- Transaction 1: Update 1, then 2
+-- Transaction 2: Update 2, then 1
+```
+
+**2. Keep transactions short:**
+```csharp
+// ❌ BAD: Long transaction
+using var transaction = await context.Database.BeginTransactionAsync();
+try
+{
+    // Complex business logic (slow!)
+    await ProcessComplexBusinessLogic();
+    await context.SaveChangesAsync();
+    await transaction.CommitAsync();
+}
+
+// ✅ GOOD: Short transaction
+// Do business logic first
+var result = await ProcessComplexBusinessLogic();
+
+// Then quick database operation
+using var transaction = await context.Database.BeginTransactionAsync();
+try
+{
+    context.Entities.Add(result);
+    await context.SaveChangesAsync();
+    await transaction.CommitAsync();
+}
+```
+
+**3. Use appropriate isolation levels:**
+```csharp
+// ✅ GOOD: Read Committed (default, less locking)
+using var transaction = await context.Database.BeginTransactionAsync(
+    IsolationLevel.ReadCommitted);
+
+// ❌ BAD: Serializable (too much locking, increases deadlock risk)
+using var transaction = await context.Database.BeginTransactionAsync(
+    IsolationLevel.Serializable);
+```
+
+**4. Add indexes to prevent table scans:**
+```sql
+-- Table scans lock entire table = deadlock risk
+-- Indexes allow row-level locks instead
+CREATE INDEX IX_Entities_Id ON Entities(Id);
+```
+
+**5. Use NOLOCK hint for read-only queries (carefully):**
+```sql
+-- Only for read-only queries that can tolerate dirty reads
+SELECT * FROM Entities WITH (NOLOCK) WHERE Status = 'Active';
+-- ⚠️ Warning: Can read uncommitted data, use with caution
+```
+
+**6. Implement retry logic:**
+```csharp
+// ✅ GOOD: Retry on deadlock
+int maxRetries = 3;
+int retryCount = 0;
+
+while (retryCount < maxRetries)
+{
+    try
+    {
+        using var transaction = await context.Database.BeginTransactionAsync();
+        try
+        {
+            // Your database operations
+            await context.SaveChangesAsync();
+            await transaction.CommitAsync();
+            break; // Success
+        }
+        catch (SqlException ex) when (ex.Number == 1205) // Deadlock
+        {
+            await transaction.RollbackAsync();
+            retryCount++;
+            
+            if (retryCount >= maxRetries)
+                throw; // Give up after max retries
+            
+            // Wait random time before retry (prevents simultaneous retries)
+            await Task.Delay(Random.Shared.Next(100, 500));
+        }
+    }
+    catch (SqlException ex) when (ex.Number == 1205 && retryCount < maxRetries)
+    {
+        // Retry outer transaction
+        continue;
+    }
+}
+```
+
+**7. Use SET DEADLOCK_PRIORITY (SQL Server):**
+```sql
+-- Make transaction less likely to be deadlock victim
+SET DEADLOCK_PRIORITY HIGH; -- This transaction survives deadlock
+-- Or
+SET DEADLOCK_PRIORITY LOW; -- This transaction is killed first
+```
+
+**8. Monitor and analyze deadlocks:**
+```sql
+-- SQL Server: Enable deadlock graph in Extended Events
+-- Or use SQL Server Profiler to capture deadlock events
+
+-- View recent deadlocks
+SELECT 
+    event_time,
+    database_name,
+    deadlock_graph
+FROM sys.fn_xe_file_target_read_file(
+    'system_health*.xel',
+    NULL, NULL, NULL
+)
+WHERE object_name = 'xml_deadlock_report';
+```
+
+**Best practices:**
+- ✅ **Always access resources in same order**
+- ✅ **Keep transactions as short as possible**
+- ✅ **Do business logic outside transactions**
+- ✅ **Use appropriate isolation levels**
+- ✅ **Add indexes to prevent table scans**
+- ✅ **Implement retry logic for deadlock errors**
+- ✅ **Monitor deadlock frequency**
+
+**Keywords:** Deadlock prevention, retry logic, transaction order, isolation levels, deadlock priority
+
+---
+
 ### SignalR
 
 #### Q: What is SignalR?
@@ -1839,6 +2063,9 @@ const connection = new signalR.HubConnectionBuilder()
 **Q: "What are index trade-offs?"**  
 **A:** "Indexes make reads much faster - queries can find rows quickly instead of scanning the table. But they slow down writes because every INSERT, UPDATE, DELETE must update the index. They also take storage space. Create indexes on frequently queried columns and foreign keys, but don't create too many."
 
+**Q: "What are deadlocks and how do you prevent them?"**  
+**A:** "Deadlocks happen when transactions wait for each other in a circle - Transaction A waits for B, B waits for A. The database kills one to break it. To prevent: always access resources in the same order, keep transactions short, use appropriate isolation levels, add indexes, and implement retry logic."
+
 ---
 
 ## ⚠️ MISTAKES TO AVOID
@@ -1863,6 +2090,9 @@ const connection = new signalR.HubConnectionBuilder()
 
 **❌ "CQRS is always needed"**  
 ✅ **Correct:** "CQRS is for complex scenarios. Simple CRUD apps don't need it."
+
+**❌ "Deadlocks can't be prevented"**  
+✅ **Correct:** "Deadlocks can be prevented by accessing resources in consistent order, keeping transactions short, and using proper isolation levels."
 
 ---
 
@@ -1960,12 +2190,13 @@ Returns result
 - "Commands" → Write operations, change state
 - "Queries" → Read operations, retrieve data
 - "Index" → Database performance, trade-offs
+- "Deadlock" → Circular wait, lock resources, transaction order, retry logic
 - "SignalR" → Real-time, WebSockets, hubs
 - "Server Components" → Next.js, server-side rendering
 - "Client Components" → Browser, hooks, interactions
 
 ---
 
-**Last updated:** 2024  
+**Last updated:** 15:14 21/01/2026
 **Use Ctrl+F to search for keywords during interviews!**  
 **All answers are formatted for easy speaking - use as guide, not script!**
